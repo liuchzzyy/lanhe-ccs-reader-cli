@@ -49,3 +49,7 @@ Run the test suite:
 ```powershell
 uv run pytest
 ```
+
+## Acknowledgement
+
+This project was completed with AI assistance.
