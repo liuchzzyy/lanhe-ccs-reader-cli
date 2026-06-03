@@ -1,0 +1,39 @@
+[project]
+name = "lanhe-ccs-reader-cli"
+version = "0.1.0"
+description = "Reverse-engineered reader for LANHE/LAND CCS battery test files."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openpyxl>=3.1.5",
+    "pandas>=2.2.3",
+]
+
+[project.scripts]
+ccs-reader = "ccs_reader.cli:main"
+ccs-reader-validate = "ccs_reader.validate:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.4",
+    "ruff>=0.9.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.0,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "ccs_reader"
+module-root = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM"]
