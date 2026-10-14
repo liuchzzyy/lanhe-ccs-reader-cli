@@ -1,6 +1,6 @@
 [project]
 name = "lanhe-ccs-reader-cli"
-version = "0.1.0"
+version = "1.0.0"
 description = "Reverse-engineered reader for LANHE/LAND CCS battery test files."
 readme = "README.md"
 requires-python = ">=3.11"

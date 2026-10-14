@@ -133,6 +133,15 @@ class CCSParser:
     def parse(self) -> CCSParseResult:
         """Parse the CCS file into records, summaries, and metadata."""
         data = self.path.read_bytes()
+        if len(data) < 0x8F0:
+            raise ValueError(f"CCS file is too short: {self.path}")
+        header, magic = struct.unpack_from("<II", data)
+        if magic == 0x95279529:
+            raise ValueError(f"Unsupported CCS version 2: {self.path}")
+        if magic != 0x95279528:
+            raise ValueError(f"Invalid CCS magic: {self.path}")
+        if header != 0x02000000:
+            raise ValueError(f"Unsupported CCS header: {self.path}")
         data_start = self._detect_data_start(data)
         page_count = (len(data) - data_start) // PAGE_SIZE
 
@@ -149,12 +158,14 @@ class CCSParser:
         if records.empty:
             raise ValueError(f"No measurement records found in {self.path}")
 
-        finish_ms = log_start_ms + int(records["TestTime_ms"].iloc[-1])
-        metadata.finish_time = _datetime_from_unix_ms(finish_ms, self.timezone)
         records = self._add_derived_record_columns(records, metadata, control_steps)
         steps = self._build_steps(records, metadata)
-        cycles = self._build_cycles(steps, metadata)
-        logs = self._build_logs(metadata)
+        cycles = self._build_cycles(steps, metadata, records)
+        logs = self._build_logs(data, metadata)
+        if not logs.empty and logs.iloc[-1]["Log Type"] == "Finish":
+            metadata.finish_time = _datetime_from_unix_ms(
+                log_start_ms + int(records["TestTime_ms"].iloc[-1]), self.timezone
+            )
         return CCSParseResult(metadata=metadata, records=records, steps=steps, cycles=cycles, logs=logs)
 
     def _detect_data_start(self, data: bytes) -> int:
@@ -251,8 +262,8 @@ class CCSParser:
             mode_code = struct.unpack_from("<I", data, offset + 8)[0]
             cycle_index = struct.unpack_from("<I", data, offset + 12)[0]
             process_step_index = struct.unpack_from("<I", data, offset + 16)[0]
-            test_start_ms = struct.unpack_from("<I", data, offset + 24)[0]
-            wall_counter = struct.unpack_from("<I", data, offset + 56)[0]
+            test_start_ms = struct.unpack_from("<Q", data, offset + 24)[0]
+            wall_counter = struct.unpack_from("<Q", data, offset + 56)[0]
             raw_steps.append(
                 (
                     offset,
@@ -272,9 +283,7 @@ class CCSParser:
         for offset, mode, cycle, process_step, test_start_ms, wall_counter in raw_steps:
             wall_start_ms: int | None = None
             if first_counter is not None and wall_counter is not None:
-                delta = (wall_counter - first_counter) & 0xFFFFFFFF
-                if delta > 0x7FFFFFFF:
-                    delta -= 0x100000000
+                delta = wall_counter - first_counter
                 wall_start_ms = log_start_ms + delta
             steps[offset] = ControlStep(
                 mode=mode,
@@ -335,8 +344,10 @@ class CCSParser:
 
                 step_time_ms += int(delta_ms)
                 test_time_ms = step_info.test_start_ms + step_time_ms
-                step_capacity_uah += abs(float(capacity_ah)) * 1_000_000.0
-                step_energy_uwh += abs(float(energy_wh)) * 1_000_000.0
+                # The native reader excludes REST (mode 1) from dQ/dE accumulation.
+                if step_info.mode.name != "REST":
+                    step_capacity_uah += abs(float(capacity_ah)) * 1_000_000.0
+                    step_energy_uwh += abs(float(energy_wh)) * 1_000_000.0
 
                 current_uA = _f32(float(current_a) * 1_000_000.0)
                 capacity_uAh = _f32(step_capacity_uah)
@@ -420,10 +431,12 @@ class CCSParser:
                     records.at[row_idx, "dQdV/uAh/V"] = _f32(dq / dv)
 
         records["Mark1"] = records["StateWord"].map(
-            lambda state: control_steps.get(
-                int(state),
-                ControlStep(_mode_for_code(int(state)), 1, 1, 0, None),
-            ).mode.mark1
+            lambda state: (
+                control_steps.get(
+                    int(state),
+                    ControlStep(_mode_for_code(int(state)), 1, 1, 0, None),
+                ).mode.mark1
+            )
         )
         records["Mark2"] = "0"
         for _, group in records.groupby("Step", sort=False):
@@ -449,9 +462,9 @@ class CCSParser:
         records["DataFile"] = _normalized_path(self.path)
         records["TestName"] = metadata.test_name
         records["ProcessName"] = metadata.process_name
-        records["Thicknessmm"] = ""
-        records["ThicknessPressureg"] = ""
-        records["ThicknessTempC"] = ""
+        records["Thicknessmm"] = "0"
+        records["ThicknessPressureg"] = "0"
+        records["ThicknessTempC"] = "0"
         records["ChannelNumber"] = metadata.channel_number
 
         return records[
@@ -499,8 +512,6 @@ class CCSParser:
 
     def _build_steps(self, records: pd.DataFrame, metadata: CCSMetadata) -> pd.DataFrame:
         rows: list[dict[str, Any]] = []
-        total_capacity_by_mode: dict[str, float] = {}
-        total_energy_by_mode: dict[str, float] = {}
 
         for step, group in records.groupby("Step", sort=False):
             first = group.iloc[0]
@@ -508,16 +519,14 @@ class CCSParser:
             mode = str(first["WorkMode"])
             capacity = float(last["Capacity/uAh"])
             energy = float(last["Energy/uWh"])
-            total_capacity_by_mode[mode] = total_capacity_by_mode.get(mode, 0.0) + capacity
-            total_energy_by_mode[mode] = total_energy_by_mode.get(mode, 0.0) + energy
             mid_voltage = _mid_voltage(group)
 
             if metadata.active_material_mass_g:
                 divisor = metadata.active_material_mass_g * 1000.0
                 spe_cap = _f32(capacity / divisor)
                 spe_energy = _f32(energy / divisor)
-                spe_cap_total = _f32(total_capacity_by_mode[mode] / divisor)
-                spe_energy_total = _f32(total_energy_by_mode[mode] / divisor)
+                spe_cap_total = spe_cap
+                spe_energy_total = spe_energy
             else:
                 spe_cap = 0.0
                 spe_energy = 0.0
@@ -532,11 +541,11 @@ class CCSParser:
                     "StepDuration": str(last["StepDuration"]),
                     "StepInProcess": str(first["StepInProcess"]),
                     "Capacity/uAh": _f32(capacity),
-                    "Capacity(Total)/uAh": _f32(total_capacity_by_mode[mode]),
+                    "Capacity(Total)/uAh": _f32(capacity),
                     "SpeCap/mAh/g": spe_cap,
                     "SpeCap(Total)/mAh/g": spe_cap_total,
                     "Energy/uWh": _f32(energy),
-                    "Energy(Total)/uWh": _f32(total_energy_by_mode[mode]),
+                    "Energy(Total)/uWh": _f32(energy),
                     "SpeEnergy/mWh/g": spe_energy,
                     "SpeEnergy(Total)/mWh/g": spe_energy_total,
                     "DCIR/KOhm": 0,
@@ -553,7 +562,7 @@ class CCSParser:
 
         return pd.DataFrame(rows)
 
-    def _build_cycles(self, steps: pd.DataFrame, metadata: CCSMetadata) -> pd.DataFrame:
+    def _build_cycles(self, steps: pd.DataFrame, metadata: CCSMetadata, records: pd.DataFrame) -> pd.DataFrame:
         rows: list[dict[str, Any]] = []
         for cycle, cycle_steps in steps.groupby("Cycle", sort=False):
             cap_c = _sum_mode(cycle_steps, charge=True, column="Capacity/uAh")
@@ -565,6 +574,15 @@ class CCSParser:
             spe_cap_d = _specific(cap_d, metadata.active_material_mass_g)
             spe_energy_c = _specific(energy_c, metadata.active_material_mass_g)
             spe_energy_d = _specific(energy_d, metadata.active_material_mass_g)
+            charge_steps = cycle_steps[cycle_steps["WorkMode"].astype(str).str.startswith("C")]
+            if not charge_steps.empty:
+                charge_duration = _sum_durations(charge_steps["StepDuration"].to_list())
+                mid_volt_c = float(charge_steps.iloc[-1]["MidVoltD/V"])
+                end_volt_c = float(charge_steps.iloc[-1]["EndVolt/V"])
+            else:
+                charge_duration = "0 00:00:00.000"
+                mid_volt_c = 0.0
+                end_volt_c = 0.0
             discharge_steps = cycle_steps[cycle_steps["WorkMode"].astype(str).str.startswith("D")]
 
             if not discharge_steps.empty:
@@ -576,6 +594,9 @@ class CCSParser:
                 mid_volt_d = 0.0
                 end_volt_d = 0.0
 
+            retention_c = 0.0
+            if metadata.nominal_specific_capacity_mAh_g and spe_cap_c:
+                retention_c = _f32(spe_cap_c / metadata.nominal_specific_capacity_mAh_g * 100.0)
             retention_d = 0.0
             if metadata.nominal_specific_capacity_mAh_g and spe_cap_d:
                 retention_d = _f32(spe_cap_d / metadata.nominal_specific_capacity_mAh_g * 100.0)
@@ -587,12 +608,12 @@ class CCSParser:
                     "CapD/uAh": _f32(cap_d),
                     "SpeCapC/mAh/g": _f32(spe_cap_c),
                     "SpeCapD/mAh/g": _f32(spe_cap_d),
-                    "CoulombEfficiency/%": _f32((cap_d / cap_c) * 100.0) if cap_c else 0,
+                    "CoulombEfficiency/%": _f32((cap_c / cap_d) * 100.0) if cap_d else 0,
                     "EnergyC/uWh": _f32(energy_c),
                     "EnergyD/uWh": _f32(energy_d),
                     "SpeEnergyC/mWh/g": _f32(spe_energy_c),
                     "SpeEnergyD/mWh/g": _f32(spe_energy_d),
-                    "EnergyEfficiency/%": _f32((energy_d / energy_c) * 100.0) if energy_c else 0,
+                    "EnergyEfficiency/%": _f32((energy_c / energy_d) * 100.0) if energy_d else 0,
                     "CC-Cap/uAh": _f32(cap_c),
                     "CC-Per/%": 100 if cap_c else 0,
                     "DC-Cap/uAh": _f32(cap_d),
@@ -604,52 +625,65 @@ class CCSParser:
                     "CapacitanceC/uF": 0,
                     "CapacitanceD/uF": 0,
                     "DCIR/KOhm": 0,
-                    "MidVoltC/V": 0,
-                    "EndVoltC/V": 0,
+                    "MidVoltC/V": mid_volt_c,
+                    "EndVoltC/V": end_volt_c,
                     "MidVoltD/V": mid_volt_d,
                     "EndVoltD/V": end_volt_d,
-                    "RetentionC/%": 0,
+                    "RetentionC/%": retention_c,
                     "RetentionD/%": retention_d,
-                    "DurationC": "0 00:00:00.000",
+                    "DurationC": charge_duration,
                     "DurationD": discharge_duration,
                     "DataFile": _normalized_path(self.path),
                     "ChannelNumber": metadata.channel_number,
-                    "AvgVoltC/V": _f32(energy_c / cap_c) if cap_c else 0,
-                    "AvgVoltD/V": energy_d / cap_d if cap_d else 0,
+                    "AvgVoltC/V": _time_weighted_voltage(records, cycle, charge=True),
+                    "AvgVoltD/V": _time_weighted_voltage(records, cycle, charge=False),
                 }
             )
 
         return pd.DataFrame(rows)
 
-    def _build_logs(self, metadata: CCSMetadata) -> pd.DataFrame:
-        rows = []
-        if metadata.log_start_time is not None:
+    def _build_logs(self, data: bytes, metadata: CCSMetadata) -> pd.DataFrame:
+        """Decode observed control-page events without inventing a finish event.
+
+        The page's 64-bit wall counter uses a different epoch from Unix time;
+        anchor it to the header's known log start, as for step timestamps.
+        """
+        columns = ["Test name", "Dev SN", "Chl Num", "Log Num", "Cycle ID", "SysTime", "Log Type", "Log Details"]
+        events: list[tuple[int, int, int]] = []
+        for offset in range(0, len(data) - PAGE_SIZE + 1, PAGE_SIZE):
+            if struct.unpack_from("<I", data, offset)[0] != CONTROL_PAGE_KIND:
+                continue
+            mode = struct.unpack_from("<I", data, offset + 8)[0]
+            if mode in (0, 1, 0x61):
+                events.append((offset, mode, struct.unpack_from("<Q", data, offset + 56)[0]))
+        if not events:
+            return pd.DataFrame(columns=columns)
+
+        first_counter = events[0][2]
+        start_ms = _read_unix_ms(data, 0xA38) or _read_unix_ms(data, 0xA8)
+        if start_ms is None:
+            return pd.DataFrame(columns=columns)
+        rows: list[dict[str, Any]] = []
+        for offset, mode, counter in events:
+            if mode == 1:
+                event_type = "Test start" if not rows else "Continue"
+            else:
+                event_type = "Finish" if mode == 0x61 else "Pause (Safety)"
+            cycle_index = struct.unpack_from("<I", data, offset + 12)[0]
+            event_time = _datetime_from_unix_ms(start_ms + counter - first_counter, self.timezone)
             rows.append(
                 {
                     "Test name": metadata.test_name,
                     "Dev SN": metadata.serial_number,
                     "Chl Num": metadata.channel_index,
-                    "Log Num": 1,
-                    "Cycle ID": 1,
-                    "SysTime": _format_datetime(metadata.log_start_time),
-                    "Log Type": "Test start",
+                    "Log Num": len(rows) + 1,
+                    "Cycle ID": int(cycle_index) + 1,
+                    "SysTime": _format_datetime(event_time),
+                    "Log Type": event_type,
                     "Log Details": "",
                 }
             )
-        if metadata.finish_time is not None:
-            rows.append(
-                {
-                    "Test name": metadata.test_name,
-                    "Dev SN": metadata.serial_number,
-                    "Chl Num": metadata.channel_index,
-                    "Log Num": 2,
-                    "Cycle ID": 1,
-                    "SysTime": _format_datetime(metadata.finish_time),
-                    "Log Type": "Finish",
-                    "Log Details": "",
-                }
-            )
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows, columns=columns)
 
 
 class CCSReader:
@@ -804,6 +838,19 @@ def _mid_voltage(group: pd.DataFrame) -> float:
     if not candidates.empty:
         return float(candidates.iloc[0]["Voltage/V"])
     return float(last["Voltage/V"])
+
+
+def _time_weighted_voltage(records: pd.DataFrame, cycle: int, *, charge: bool) -> float:
+    """Average measured voltage over elapsed time, resetting time at each step."""
+    prefix = "C" if charge else "D"
+    selected = records[(records["Cycle"] == cycle) & records["WorkMode"].astype(str).str.startswith(prefix)]
+    if selected.empty:
+        return 0.0
+    elapsed = selected.groupby("Step", sort=False)["StepTime_ms"].diff().fillna(selected["StepTime_ms"])
+    total_ms = float(elapsed.sum())
+    if total_ms <= 0:
+        return 0.0
+    return float((selected["Voltage/V"] * elapsed).sum() / total_ms)
 
 
 def _sum_mode(steps: pd.DataFrame, *, charge: bool, column: str) -> float:

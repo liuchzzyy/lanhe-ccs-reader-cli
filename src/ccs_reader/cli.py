@@ -22,12 +22,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _safe_csv_cell(value: object) -> object:
+    """Keep untrusted text inert when a CSV is opened in a spreadsheet."""
+    if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     result = read_ccs(args.ccs_file, timezone=args.timezone)
 
     if args.csv:
-        result.records.to_csv(args.csv, index=False, encoding="utf-8-sig")
+        exported = result.records.copy()
+        for name in exported.select_dtypes(include=["object", "string"]).columns:
+            exported[name] = exported[name].map(_safe_csv_cell)
+        exported.to_csv(args.csv, index=False, encoding="utf-8-sig")
     if args.summary_json:
         result.write_summary_json(args.summary_json)
 

@@ -33,9 +33,10 @@ junit.xml
 .env.*
 !.env.example
 
-# Local generated exports
+# Local generated exports and analysis inputs
 *.parsed.csv
 *.summary.json
+samples/CCSData.exe
 
 # OS and editor noise
 .DS_Store

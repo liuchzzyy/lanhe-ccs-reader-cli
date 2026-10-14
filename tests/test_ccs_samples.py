@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
+from openpyxl import load_workbook
 
 from ccs_reader import CCSReader, read_ccs
 from ccs_reader.validate import validate_against_xlsx
@@ -106,3 +108,26 @@ def test_large_ccs_sample_parses_without_vendor_xlsx() -> None:
     assert len(result.steps) == 3
     assert len(result.cycles) == 1
     assert len(result.logs) == 2
+
+
+@pytest.mark.parametrize(("ccs_path", "xlsx_path"), [(AA_CCS, AA_XLSX), (BB_CCS, BB_XLSX)])
+def test_control_page_logs_match_vendor_export(ccs_path: Path, xlsx_path: Path) -> None:
+    """Log events come from control pages, not a synthetic final record."""
+    vendor = load_workbook(xlsx_path, read_only=True, data_only=True)
+    try:
+        expected = []
+        for row in list(vendor["Log"].values)[1:]:
+            assert isinstance(row[5], datetime)
+            expected.append((row[3], row[4], row[5].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], row[6]))
+    finally:
+        vendor.close()
+    parsed = read_ccs(ccs_path).logs
+    actual = [(row["Log Num"], row["Cycle ID"], row["SysTime"], row["Log Type"]) for _, row in parsed.iterrows()]
+    assert actual == expected
+
+
+def test_unfinished_sample_has_no_synthetic_finish_event() -> None:
+    result = read_ccs(BB_CCS)
+    assert result.logs["Log Type"].to_list() == ["Test start", "Pause (Safety)", "Continue", "Pause (Safety)"]
+    assert result.logs.iloc[-1]["Cycle ID"] == 3
+    assert result.logs.iloc[-1]["SysTime"] == "2025-10-12 05:27:54.109"

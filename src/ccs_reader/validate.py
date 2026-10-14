@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -135,6 +136,17 @@ def _compare_numeric_column(
     for row_index, row in enumerate(official_rows):
         parsed_value = parsed_values[row_index]
         official_value = float(row[check.xlsx_index] or 0.0)
+        if not math.isfinite(parsed_value) or not math.isfinite(official_value):
+            if first_failure is None:
+                first_failure = {
+                    "row": row_index,
+                    "record": int(row[2]),
+                    "parsed": str(parsed_value),
+                    "xlsx": str(official_value),
+                    "error": "non-finite value",
+                    "tolerance": check.tolerance,
+                }
+            continue
         error = abs(parsed_value - official_value)
         mean_error += error
         if error > max_error:
